@@ -1,20 +1,36 @@
+import json
+import math
+import random
+import socket
 import time
 import uuid
 import asyncio
+import pygame
+import struct
 from aioquic.asyncio import serve, QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
-import struct
+
 
 CONNECTED_CLIENTS = set()
-SPEED = 4
+SPEED = 3
+WIDTH = 1200
+HEIGHT = 700
+UP = 1 << 0
+LEFT = 1 << 1
+DOWN = 1 << 2
+RIGHT = 1 << 3
+MAP_WIDTH = 2500
+MAP_HEIGHT = 1500
+PLAYER_WIDTH = 37
+PLAYER_HEIGHT = 56
 
 
 class GameServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.x = 1920/2
-        self.y = 1080/2
+        self.x = WIDTH//2 - 18
+        self.y = HEIGHT//2 - 28
         self.client_id = None
         self.last_seq = 0
         self.control_stream_id = None
@@ -37,7 +53,7 @@ class GameServerProtocol(QuicConnectionProtocol):
             CONNECTED_CLIENTS.add(self)
             # Client is now authenticated & encrypted.
             # Each connection performs a handshake to connect, once the event is completed
-            payload = struct.pack("!B16s", 0, self.client_id.bytes)
+            payload = struct.pack("!B16sff", 0, self.client_id.bytes, self.x, self.y)
             packet = struct.pack("!H", len(payload)) + payload
             self._quic.send_stream_data(self.control_stream_id, packet, end_stream=False)
             self.transmit()
@@ -87,21 +103,72 @@ class GameServerProtocol(QuicConnectionProtocol):
             self.transmit()
 
     def change_pos(self, intent):
-        if intent == 1:
-            self.y -= SPEED
-        elif intent == 3:
-            self.y += SPEED
-        elif intent == 2:
-            self.x -= SPEED
-        elif intent == 4:
-            self.x += SPEED
+        dx = dy = 0
 
-        print("new x, y value {}, {}".format(self.x, self.y))
+        if intent & UP:
+            dy -= SPEED
+        if intent & DOWN:
+            dy += SPEED
+        if intent & LEFT:
+            dx -= SPEED
+        if intent & RIGHT:
+            dx += SPEED
+
+        if dx != 0 and dy != 0:
+            scale = 1 / math.sqrt(2)
+            dx *= scale
+            dy *= scale
+
+        self.collisions(dx, dy)
+
+    def collisions(self, dx, dy):
+        # ---- Separate axis collisions ----
+        new_x = self.x + dx
+        new_y = self.y + dy
+
+        for client in CONNECTED_CLIENTS:
+            if client is self:
+                continue
+            overlap_x = abs(new_x - client.x) < PLAYER_WIDTH
+            overlap_y = abs(new_y - client.y) < PLAYER_HEIGHT
+
+            # Check if overlapping currently
+            currently_overlap_x = abs(self.x - client.x) < PLAYER_WIDTH
+            currently_overlap_y = abs(self.y - client.y) < PLAYER_HEIGHT
+
+            if currently_overlap_x and currently_overlap_y:
+                # Only allow movement that increases distance
+                if dx > 0 and self.x < client.x:  # moving right into them? block
+                    new_x = self.x
+                if dx < 0 and self.x > client.x:  # moving left into them? block
+                    new_x = self.x
+                if dy > 0 and self.y < client.y:  # moving down into them? block
+                    new_y = self.y
+                if dy < 0 and self.y > client.y:  # moving up into them? block
+                    new_y = self.y
+            else:
+                # Normal collision handling: prevent entering other players
+                if overlap_x and overlap_y:
+                    # Axis-separated collision
+                    if abs(dx) > abs(dy):
+                        new_x = self.x
+                    else:
+                        new_y = self.y
+
+        # Clamp to map boundaries
+        new_x = max(0, min(new_x, MAP_WIDTH - PLAYER_WIDTH))
+        new_y = max(0, min(new_y, MAP_HEIGHT - PLAYER_HEIGHT))
+
+        # Apply movement
+        self.x = new_x
+        self.y = new_y
 
     def connection_loss(self):
-        CONNECTED_CLIENTS.discard(self)
+        if self in list(CONNECTED_CLIENTS):
+            CONNECTED_CLIENTS.remove(self)
+
         print(f"Client {self.client_id} disconnected")
-        for client in CONNECTED_CLIENTS:
+        for client in list(CONNECTED_CLIENTS):
                 payload = struct.pack (
                     "!B16s",
                     3,
@@ -116,7 +183,7 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.connection_loss()
 
     def broadcast_world_state(self):
-        for client in CONNECTED_CLIENTS:
+        for client in list(CONNECTED_CLIENTS):
             if client is not self:
                 payload = struct.pack(
                     "!B16sff",           # means transfer one byte 16 bytes and two floats
@@ -131,7 +198,7 @@ class GameServerProtocol(QuicConnectionProtocol):
                 client.transmit()
 
     def broadcast_online_clients(self):
-        for client in CONNECTED_CLIENTS:
+        for client in list(CONNECTED_CLIENTS):
             payload = struct.pack(
                 "!B16sff",
                 2,                    # msg_type = online members
@@ -145,7 +212,7 @@ class GameServerProtocol(QuicConnectionProtocol):
             self.transmit()
 
     def broadcast_new_connection(self):
-        for client in CONNECTED_CLIENTS:
+        for client in list(CONNECTED_CLIENTS):
             payload = struct.pack(
                 "!B16sff",
                 2,
@@ -173,6 +240,24 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.transmit()
 
 
+async def broadcast_server():
+    await asyncio.sleep(0.5) # allow server socket to bind
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # allow the socket to send on broadcast
+    message = json.dumps(
+        {
+            "service": "mmo-server",
+            "host": "game-server.local",
+            "port": 4433
+        }
+    ).encode() # create a small json message
+
+    while True:
+        sock.sendto(message, ("255.255.255.255", 37020)) # broadcast on port 37020
+        print("sent Broadcast")
+        await asyncio.sleep(4) # broadcast every 4 seconds
+
+
 async def check_heartbeats():
     """Background task to detect dead connections"""
     while True:
@@ -193,11 +278,12 @@ async def check_heartbeats():
                 print("could not close quic connection")
                 pass
 
-async def main():
+
+async def start_server():
     # Quic settings
     config = QuicConfiguration(
-        is_client=False,        # This is not a client this is a server.
-        alpn_protocols=["mmo"] # ALPN = Aplication Layer Protocol Negotiation.
+        is_client=False,  # This is not a client this is a server.
+        alpn_protocols=["mmo"]  # ALPN = Aplication Layer Protocol Negotiation.
         # This means after encryption starts, it asks what kind of protocol are you using?
         # And I say mmo (its like a handshake label, there is no such protocol as mmo).
     )
@@ -205,17 +291,26 @@ async def main():
     # The certificate contains my public key and the server identity info.
     # The certificate proves who you are and the private key proves you own it.
 
-    await serve(                            # Pause the whole function until this is done (until server is fully started)
-        "0.0.0.0",                     # Anyone wanting to connect can connect
-        4433,                          # The server is on port 4433
-        configuration=config,               # Set the configuration (rules of the connection)
+    asyncio.create_task(check_heartbeats())
+
+    await serve(  # Pause the whole function until this is done (until server is fully started)
+        "0.0.0.0",  # Anyone wanting to connect can connect
+        4433,  # The server is on port 4433
+        configuration=config,  # Set the configuration (rules of the connection)
         create_protocol=GameServerProtocol  # For each client connection, create a new GameServerProtocol objet
     )
 
-    asyncio.create_task(check_heartbeats())
-
     try:
-        await asyncio.Future()                  # Run this forever
+        await asyncio.Future()  # Run this forever
+    except asyncio.CancelledError:
+        print()
+
+
+async def main():
+    server_task = asyncio.create_task(start_server())
+    broadcast_task = asyncio.create_task(broadcast_server())
+    try:
+        await asyncio.gather(server_task, broadcast_task)
     except asyncio.CancelledError:
         print()
 
