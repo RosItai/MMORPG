@@ -254,7 +254,7 @@ class GameClientProtocol(QuicConnectionProtocol):
         new_y = local_player.y + dy
 
         for pid, (client, _) in self.players.items():
-            if pid != self.client_id:
+            if pid == self.client_id:
                 continue
             overlap_x = abs(new_x - client.x) < PLAYER_WIDTH
             overlap_y = abs(new_y - client.y) < PLAYER_HEIGHT
