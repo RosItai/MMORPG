@@ -129,8 +129,6 @@ class GameServerProtocol(QuicConnectionProtocol):
         for client in CONNECTED_CLIENTS:
             if client is self:
                 continue
-            overlap_x = abs(new_x - client.x) < PLAYER_WIDTH
-            overlap_y = abs(new_y - client.y) < PLAYER_HEIGHT
 
             # Check if overlapping currently
             currently_overlap_x = abs(self.x - client.x) < PLAYER_WIDTH
@@ -138,22 +136,26 @@ class GameServerProtocol(QuicConnectionProtocol):
 
             if currently_overlap_x and currently_overlap_y:
                 # Only allow movement that increases distance
-                if dx > 0 and self.x < client.x:  # moving right into them? block
-                    new_x = self.x
-                if dx < 0 and self.x > client.x:  # moving left into them? block
-                    new_x = self.x
-                if dy > 0 and self.y < client.y:  # moving down into them? block
-                    new_y = self.y
-                if dy < 0 and self.y > client.y:  # moving up into them? block
-                    new_y = self.y
+                if dx != 0:
+                    if (self.x - client.x) * dx < 0:
+                        new_x = self.x
+                if dy != 0:
+                    if (self.y - client.y) * dy < 0:
+                        new_y = self.y
             else:
                 # Normal collision handling: prevent entering other players
-                if overlap_x and overlap_y:
-                    # Axis-separated collision
-                    if abs(dx) > abs(dy):
-                        new_x = self.x
-                    else:
-                        new_y = self.y
+                # Try X movement first
+                test_x = self.x + dx
+                if abs(test_x - client.x) < PLAYER_WIDTH and abs(self.y - client.y) < PLAYER_HEIGHT:
+                    test_x = self.x  # block X
+
+                # Then Y movement
+                test_y = self.y + dy
+                if abs(test_x - client.x) < PLAYER_WIDTH and abs(test_y - client.y) < PLAYER_HEIGHT:
+                    test_y = self.y  # block Y
+
+                new_x = test_x
+                new_y = test_y
 
         # Clamp to map boundaries
         new_x = max(0, min(new_x, MAP_WIDTH - PLAYER_WIDTH))
