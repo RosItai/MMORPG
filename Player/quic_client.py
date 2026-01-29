@@ -245,48 +245,46 @@ class GameClientProtocol(QuicConnectionProtocol):
             dx *= scale
             dy *= scale
 
-        self.collisions(dy, dx)
+        self.collisions(dx, dy)
 
-    def collisions(self, dy, dx):
+    def collisions(self, dx, dy):
         # ---- Separate axis collisions ----
         local_player = self.players[self.client_id][0]
-        new_x = local_player.x + dx
-        new_y = local_player.y + dy
+
+        allow_x = True
+        allow_y = True
 
         for pid, (client, _) in self.players.items():
             if pid == self.client_id:
                 continue
 
-            # Check if overlapping currently
-            currently_overlap_x = abs(local_player.x - client.x) < PLAYER_WIDTH
-            currently_overlap_y = abs(local_player.y - client.y) < PLAYER_HEIGHT
+            overlap_x = abs(local_player.x - client.x) < PLAYER_WIDTH
+            overlap_y = abs(local_player.y - client.y) < PLAYER_HEIGHT
 
-            if currently_overlap_x and currently_overlap_y:
-                # Only allow movement that increases distance
-                if dx != 0:
-                    if (local_player.x - client.x) * dx < 0:
-                        new_x = local_player.x
-                if dy != 0:
-                    if (local_player.y - client.y) * dy < 0:
-                        new_y = local_player.y
-            else:
-                # Normal collision handling: prevent entering other players
-                # Try X movement first
+            if overlap_x and overlap_y:
+                if dx != 0 and (local_player.x - client.x) * dx < 0:
+                    allow_x = False
+                if dy != 0 and (local_player.y - client.y) * dy < 0:
+                    allow_y = False
+                continue
+
+            if dx != 0:
                 test_x = local_player.x + dx
                 if abs(test_x - client.x) < PLAYER_WIDTH and abs(local_player.y - client.y) < PLAYER_HEIGHT:
-                    test_x = local_player.x  # block X
+                    allow_x = False
 
-                # Then Y movement
+            if dy != 0:
                 test_y = local_player.y + dy
-                if abs(test_x - client.x) < PLAYER_WIDTH and abs(test_y - client.y) < PLAYER_HEIGHT:
-                    test_y = local_player.y  # block Y
+                if abs(local_player.x - client.x) < PLAYER_WIDTH and abs(test_y - client.y) < PLAYER_HEIGHT:
+                    allow_y = False
 
-                new_x = test_x
-                new_y = test_y
+        if allow_x:
+            local_player.x += dx
+        if allow_y:
+            local_player.y += dy
 
-        # Clamp to map boundaries
-        new_x = max(0, min(new_x, MAP_WIDTH - PLAYER_WIDTH))
-        new_y = max(0, min(new_y, MAP_HEIGHT - PLAYER_HEIGHT))
+        new_x = max(0, min(local_player.x, MAP_WIDTH - PLAYER_WIDTH))
+        new_y = max(0, min(local_player.y, MAP_HEIGHT - PLAYER_HEIGHT))
 
         # Apply movement
         self.players[self.client_id][0].x = new_x

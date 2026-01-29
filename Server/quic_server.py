@@ -122,48 +122,45 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.collisions(dx, dy)
 
     def collisions(self, dx, dy):
-        # ---- Separate axis collisions ----
-        new_x = self.x + dx
-        new_y = self.y + dy
+        allow_x = True
+        allow_y = True
 
         for client in CONNECTED_CLIENTS:
             if client is self:
                 continue
 
-            # Check if overlapping currently
-            currently_overlap_x = abs(self.x - client.x) < PLAYER_WIDTH
-            currently_overlap_y = abs(self.y - client.y) < PLAYER_HEIGHT
+            # --- Check overlap ---
+            overlap_x = abs(self.x - client.x) < PLAYER_WIDTH
+            overlap_y = abs(self.y - client.y) < PLAYER_HEIGHT
 
-            if currently_overlap_x and currently_overlap_y:
-                # Only allow movement that increases distance
-                if dx != 0:
-                    if (self.x - client.x) * dx < 0:
-                        new_x = self.x
-                if dy != 0:
-                    if (self.y - client.y) * dy < 0:
-                        new_y = self.y
-            else:
-                # Normal collision handling: prevent entering other players
-                # Try X movement first
+            # --- If overlapping: only allow moving AWAY ---
+            if overlap_x and overlap_y:
+                if dx != 0 and (self.x - client.x) * dx < 0:
+                    allow_x = False
+                if dy != 0 and (self.y - client.y) * dy < 0:
+                    allow_y = False
+                continue
+
+            # --- Normal collision ---
+            if dx != 0:
                 test_x = self.x + dx
                 if abs(test_x - client.x) < PLAYER_WIDTH and abs(self.y - client.y) < PLAYER_HEIGHT:
-                    test_x = self.x  # block X
+                    allow_x = False
 
-                # Then Y movement
+            if dy != 0:
                 test_y = self.y + dy
-                if abs(test_x - client.x) < PLAYER_WIDTH and abs(test_y - client.y) < PLAYER_HEIGHT:
-                    test_y = self.y  # block Y
+                if abs(self.x - client.x) < PLAYER_WIDTH and abs(test_y - client.y) < PLAYER_HEIGHT:
+                    allow_y = False
 
-                new_x = test_x
-                new_y = test_y
+        # --- Apply movement ONCE ---
+        if allow_x:
+            self.x += dx
+        if allow_y:
+            self.y += dy
 
-        # Clamp to map boundaries
-        new_x = max(0, min(new_x, MAP_WIDTH - PLAYER_WIDTH))
-        new_y = max(0, min(new_y, MAP_HEIGHT - PLAYER_HEIGHT))
-
-        # Apply movement
-        self.x = new_x
-        self.y = new_y
+        # --- Clamp to map ---
+        self.x = max(0, min(self.x, MAP_WIDTH - PLAYER_WIDTH))
+        self.y = max(0, min(self.y, MAP_HEIGHT - PLAYER_HEIGHT))
 
     def connection_loss(self):
         if self in list(CONNECTED_CLIENTS):
