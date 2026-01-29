@@ -282,7 +282,7 @@ async def start_server():
     # Quic settings
     config = QuicConfiguration(
         is_client=False,  # This is not a client this is a server.
-        alpn_protocols=["mmo"]  # ALPN = Aplication Layer Protocol Negotiation.
+        alpn_protocols=["mmo"]  # ALPN = Application Layer Protocol Negotiation.
         # This means after encryption starts, it asks what kind of protocol are you using?
         # And I say mmo (its like a handshake label, there is no such protocol as mmo).
     )
