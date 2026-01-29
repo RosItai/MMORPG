@@ -44,7 +44,7 @@ class GameServerProtocol(QuicConnectionProtocol):
 
     def quic_event_received(self, event): # This is the only function QUIC calls.
         # Handshake
-        if isinstance(event, HandshakeCompleted): # If an event is detected, check if it`s a handshake completion
+        if isinstance(event, HandshakeCompleted): # If an event is detected, check if it's a handshake completion
             print("Client connected")
             self.client_id = uuid.uuid4()
             self.control_stream_id = self._quic.get_next_available_stream_id(False)
