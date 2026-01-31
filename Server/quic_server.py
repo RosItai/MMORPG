@@ -122,7 +122,6 @@ class GameServerProtocol(QuicConnectionProtocol):
             print("Hand shake complete")
 
         elif isinstance(event, StreamDataReceived):
-            print(f"RX stream={event.stream_id}, len={len(event.data)}")
             self.recv_buffer.extend(event.data)
             self.process_recv_buffer()
 
@@ -210,7 +209,6 @@ class GameServerProtocol(QuicConnectionProtocol):
 
         if msg_type == 1:  # If msg type is 1 (aka I chose it to be intent movement)
             intent, seq = struct.unpack("!BH", data[1:])  # Unpack the data as a structure
-            print("Received intent {}".format(str(intent)))
             if intent & DIR_MASK == 0:
                 return
             self.last_seq = seq
@@ -443,7 +441,6 @@ async def broadcast_server():
 
     while True:
         sock.sendto(message, ("255.255.255.255", 37020)) # broadcast on port 37020
-        print("sent Broadcast")
         await asyncio.sleep(4) # broadcast every 4 seconds
 
 
@@ -506,4 +503,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    print("server is running...")
     asyncio.run(main())

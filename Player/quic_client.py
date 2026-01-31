@@ -468,7 +468,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("running")
+        print("client is running...")
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
