@@ -13,22 +13,31 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
 from collections import deque
 
-
 IMAGE = 'men-stands.png'
 IMAGE_BK = "Background.png"
+
 SPEED = 3
+SPRINT_SPEED = 6
+CROUCH_SPEED = 1
+
 WIDTH = 1200
 HEIGHT = 700
+
 SERVER_TIMEOUT = 6.0
 PING_INTERVAL = 2.0
+
 UP = 1 << 0
 LEFT = 1 << 1
 DOWN = 1 << 2
 RIGHT = 1 << 3
+SPRINT = 1 << 4
+CROUCH = 1 << 5
+
+DIR_MASK = UP | LEFT | DOWN | RIGHT
+
 MAP_WIDTH = 2500
 MAP_HEIGHT = 1500
-CAM_BORDER_X = WIDTH // 4   # 25% of the left/right
-CAM_BORDER_Y = HEIGHT // 4  # 25% of the top/bottom
+
 PLAYER_WIDTH = 37
 PLAYER_HEIGHT = 56
 
@@ -60,6 +69,7 @@ class GameClientProtocol(QuicConnectionProtocol):
         self.last_server_activity = time.monotonic()
         self.last_ping_sent = 0.0
         self.message_queue = deque()
+        self.initialized = False
 
     def quic_event_received(self, event):
         if isinstance(event, HandshakeCompleted):
@@ -101,7 +111,6 @@ class GameClientProtocol(QuicConnectionProtocol):
         packet = struct.pack("!H", len(payload)) + payload
         self._quic.send_stream_data(self.input_stream_id, packet, end_stream=False)
         self.transmit()
-        print("sent heartbeat")
 
 
     def _handle_message(self, data, stream_id):
@@ -129,6 +138,7 @@ class GameClientProtocol(QuicConnectionProtocol):
             self.players[client_id] = [self.player, self.rect]
             self.players[client_id][0].x = int(x)
             self.players[client_id][0].y = int(y)
+            self.initialized = True
 
         elif msg_type == 3:  # a player disconnected
             raw_id = struct.unpack("!16s", data[1:])[0]
@@ -164,12 +174,16 @@ class GameClientProtocol(QuicConnectionProtocol):
                 # and keeps the ones that have not yet been confirmed by the server
 
                 for _, intent in self.pending_inputs:
-                    self._prediction(intent)
+                    if intent & DIR_MASK:
+                        self._prediction(intent)
 
         elif msg_type == 6:
-            print("connection alive")
+            pass
 
     def send_intent(self, intent):
+        if not self.initialized:
+            return
+
         if self.client_id not in self.players:
             return
 
@@ -186,6 +200,9 @@ class GameClientProtocol(QuicConnectionProtocol):
         self.transmit()
 
     def draw(self, screen):
+        if not self.initialized:
+            return
+
         if self.client_id not in self.players:
             return
 
@@ -198,10 +215,10 @@ class GameClientProtocol(QuicConnectionProtocol):
         cam_x = max(0, min(cam_x, MAP_WIDTH - WIDTH))
         cam_y = max(0, min(cam_y, MAP_HEIGHT - HEIGHT))
 
-        bg_x = -cam_x
-        bg_y = -cam_y
+        camera_rect = pygame.Rect(cam_x, cam_y, WIDTH, HEIGHT)
 
-        screen.blit(self.image_bk, (bg_x, bg_y))
+        view = self.image_bk.subsurface(camera_rect)
+        screen.blit(view, (0,0))
 
         for pid, (player, _) in self.players.items():
             if pid != self.client_id:
@@ -231,21 +248,41 @@ class GameClientProtocol(QuicConnectionProtocol):
 
         dx = dy = 0
 
-        if intent & UP:
-            dy -= SPEED
-        if intent & DOWN:
-            dy += SPEED
-        if intent & LEFT:
-            dx -= SPEED
-        if intent & RIGHT:
-            dx += SPEED
+        if intent & SPRINT and not intent & CROUCH:
+            if intent & UP:
+                dy -= SPRINT_SPEED
+            if intent & DOWN:
+                dy += SPRINT_SPEED
+            if intent & LEFT:
+                dx -= SPRINT_SPEED
+            if intent & RIGHT:
+                dx += SPRINT_SPEED
+        elif intent & CROUCH and not intent & SPRINT:
+            if intent & UP:
+                dy -= CROUCH_SPEED
+            if intent & DOWN:
+                dy += CROUCH_SPEED
+            if intent & LEFT:
+                dx -= CROUCH_SPEED
+            if intent & RIGHT:
+                dx += CROUCH_SPEED
+        else:
+            if intent & UP:
+                dy -= SPEED
+            if intent & DOWN:
+                dy += SPEED
+            if intent & LEFT:
+                dx -= SPEED
+            if intent & RIGHT:
+                dx += SPEED
 
         if dx != 0 and dy != 0:
             scale = 1/math.sqrt(2)
             dx *= scale
             dy *= scale
 
-        self.collisions(dx, dy)
+        if dx != 0 or dy != 0:
+            self.collisions(dx, dy)
 
     def collisions(self, dx, dy):
         # ---- Separate axis collisions ----
@@ -290,6 +327,10 @@ class GameClientProtocol(QuicConnectionProtocol):
         self.players[self.client_id][0].x = new_x
         self.players[self.client_id][0].y = new_y
 
+    def convert_images(self):
+        self.image = self.image.convert_alpha()
+        self.image_bk = self.image_bk.convert()
+
 
 async def display_fps(screen, clock):
     fnt = pygame.font.SysFont("Italian", 20)
@@ -304,6 +345,8 @@ async def game_loop(client: GameClientProtocol):
     screen = pygame.display.set_mode((width, height))
     clock = pygame.time.Clock()
     pygame.display.set_caption("MMO Game")
+
+    client.convert_images()
 
     running = True
 
@@ -322,6 +365,7 @@ async def game_loop(client: GameClientProtocol):
 
         if current_time - last_input_time >= input_cooldown:
             keys = pygame.key.get_pressed()
+            mods = pygame.key.get_mods()
             intent = 0
 
             if keys[pygame.K_UP]:
@@ -336,28 +380,34 @@ async def game_loop(client: GameClientProtocol):
             if keys[pygame.K_RIGHT]:
                 intent |= RIGHT
 
+            if mods & pygame.KMOD_CTRL:
+                intent |= SPRINT
 
-            if intent != 0:
+            if mods & pygame.KMOD_SHIFT:
+                intent |= CROUCH
+
+            if intent & DIR_MASK: # Only check the direction bits (if at least one is on, continue)
                 client.send_intent(intent)  # send intent
                 last_input_time = current_time
-                print("sent intent {}".format(intent))
 
-        if now -client.last_ping_sent >= PING_INTERVAL:
-            client.send_heartbeat()
-            client.last_ping_sent = now
+        if now - client.last_ping_sent >= PING_INTERVAL:
+            if client.initialized:
+                client.send_heartbeat()
+                client.last_ping_sent = now
 
         if now - client.last_server_activity > SERVER_TIMEOUT:
             client.connected = False
+            print("exiting")
             pygame.quit()
             sys.exit(0)
 
-        screen.fill((255, 255, 255))
         client.draw(screen)
         await display_fps(screen, clock)
         pygame.display.flip()
-        clock.tick(240)
+        clock.tick(60)
         await asyncio.sleep(0)
 
+    print("disconnecting...")
     client.send_disconnect()
     await asyncio.sleep(0.1)
     pygame.quit()
@@ -365,13 +415,14 @@ async def game_loop(client: GameClientProtocol):
 
 async def discover_server(timeout=5):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", 37020))
     sock.settimeout(timeout)
 
     try:
         data, addr = sock.recvfrom(1024)
         info = json.loads(data.decode())
-        if info["service"] == "mmo-server":
+        if info["service"] == "mm0Rgb-!#sErv-7":
             return addr[0], info["port"], info["host"]
     except socket.timeout:
         return None
@@ -410,16 +461,16 @@ async def main():
 
             await game_loop(client)
     except Exception as e:
-        print(e)
+        print("exception occurred", repr(e))
     finally:
         pygame.quit()
 
 
 if __name__ == "__main__":
     try:
+        print("running")
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
     finally:
-
         sys.exit(0)
