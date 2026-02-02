@@ -13,6 +13,9 @@ from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
 # ===========================
 # GLOBALS
 # ===========================
+MAP_PATH = "new_map.txt"
+
+SERVER_TICK = 1/60
 
 CONNECTED_CLIENTS = set()
 
@@ -29,10 +32,42 @@ CROUCH = 1 << 5
 
 DIR_MASK = UP | LEFT | DOWN | RIGHT
 
-MAP_WIDTH = 2500
-MAP_HEIGHT = 1500
+MAP_WIDTH = 1920 * 40 # 76800 pixels
+MAP_HEIGHT = 1080 * 40 # 43200 pixels
+MAP_HALF_WIDTH  = MAP_WIDTH // 2
+MAP_HALF_HEIGHT = MAP_HEIGHT // 2
+
 PLAYER_WIDTH = 37
 PLAYER_HEIGHT = 56
+
+TILE_SIZE =40
+TILE_DEFS = {
+    '#': False,
+    '.': True,
+
+    '←': True,
+    '→': True,
+    '↑': True,
+    '↓': True,
+
+    '↖': True,
+    '↗': True,
+    '↘': True,
+    '↙': True,
+
+    '⇦': True,
+    '⇨': True,
+    '⇧': True,
+    '⇩': True,
+}
+TILE_DICT = {}
+
+LAVA_DAMAGE = 2.5
+LAVA_INTERVAL = 0.5
+
+SEQ_BITS = 16
+SEQ_MAX = 1 << SEQ_BITS
+SEQ_HALF = SEQ_MAX >> 1
 
 redis_client: redis.Redis | None = None
 redis_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
@@ -63,8 +98,7 @@ async def redis_load_player_state(client_id: uuid.UUID):
     return {
         "x": float(data[b"x"]),
         "y": float(data[b"y"]),
-        "last_seq": int(data[b"last_seq"]),
-        "last_heartbeat": float(data[b"last_heartbeat"]),
+        "hp": int(data[b"hp"]),
     }
 
 
@@ -79,8 +113,7 @@ async def redis_writer():
                 mapping={
                     "x": snapshot["x"],
                     "y": snapshot["y"],
-                    "last_seq": snapshot["last_seq"],
-                    "last_heartbeat": snapshot["last_heartbeat"],
+                    "hp": snapshot["hp"],
                 }
             )
         except Exception as e:
@@ -97,11 +130,13 @@ class GameServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.x = MAP_WIDTH//2 - 18
-        self.y = MAP_HEIGHT//2 - 28
+        self.x = -PLAYER_WIDTH // 2
+        self.y = -PLAYER_HEIGHT // 2
+        self.hp = 100
 
         self.client_id: uuid.UUID | None = None
         self.last_seq = 0
+        self.damage_seq = 0
 
         self.control_stream_id = None
         self.state_stream_id = None
@@ -109,7 +144,9 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.recv_buffer = bytearray()
 
         self.last_heartbeat = time.time()
-        self.heartbeat_timeout = 5.0
+        self.heartbeat_timeout = 7.0
+
+        self.current_intent = 0
 
     # ===========================
     # QUIC EVENTS
@@ -143,28 +180,25 @@ class GameServerProtocol(QuicConnectionProtocol):
         if state:
             self.x = state["x"]
             self.y = state["y"]
-            self.last_seq = state["last_seq"]
-            self.last_heartbeat = state["last_heartbeat"]
+            self.hp = state["hp"]
         else:
             # First time players
-            self.x = MAP_WIDTH//2 - 18
-            self.y = MAP_HEIGHT//2 - 28
-            self.last_seq = 0
-            self.last_heartbeat = time.time()
+            self.x = -PLAYER_WIDTH // 2
+            self.y = -PLAYER_HEIGHT // 2
+            self.hp = 100
 
             snapshot = ({
                 "client_id": self.client_id,
                 "x": self.x,
                 "y": self.y,
-                "last_seq": self.last_seq,
-                "last_heartbeat": self.last_heartbeat
+                "hp": self.hp
             })
 
             await try_enqueue_redis(snapshot)
 
         CONNECTED_CLIENTS.add(self)
 
-        payload = struct.pack("!B16sff", 0, self.client_id.bytes, self.x, self.y)
+        payload = struct.pack("!B16sfff", 0, self.client_id.bytes, self.x, self.y, self.hp)
         packet = struct.pack("!H", len(payload)) + payload
         self._quic.send_stream_data(self.control_stream_id, packet, end_stream=False)
         self.transmit()
@@ -207,32 +241,20 @@ class GameServerProtocol(QuicConnectionProtocol):
     def handle_message(self, data):
         msg_type = data[0]  # We use binary protocol. The first byte is the message type
 
-        if msg_type == 1:  # If msg type is 1 (aka I chose it to be intent movement)
-            intent, seq = struct.unpack("!BH", data[1:])  # Unpack the data as a structure
-            if intent & DIR_MASK == 0:
-                return
-            self.last_seq = seq
-            self.change_pos(intent)
-
-            snapshot = ({
-                "client_id": self.client_id,
-                "x": self.x,
-                "y": self.y,
-                "last_seq": self.last_seq,
-                "last_heartbeat": self.last_heartbeat
-            })
-
-            asyncio.create_task(try_enqueue_redis(snapshot))
-
-            # Send authoritative state back
-            self.broadcast_world_state()
-            self.send_self_movement()
-
-        elif msg_type == 0:
+        if msg_type == 0:
             typee = struct.unpack("!B", data[1:])
             typee = int(typee[0])
             if typee == 0:
                 self.connection_loss()
+
+        elif msg_type == 1:  # If msg type is 1 (aka I chose it to be intent movement)
+            intent, seq = struct.unpack("!BH", data[1:])  # Unpack the data as a structure
+            if intent & DIR_MASK == 0:
+                return
+
+            if seq_newer(seq, self.last_seq):
+                self.last_seq = seq
+                self.current_intent = intent
 
         elif msg_type == 5:
             self.last_heartbeat = time.time()
@@ -240,8 +262,7 @@ class GameServerProtocol(QuicConnectionProtocol):
                 "client_id": self.client_id,
                 "x": self.x,
                 "y": self.y,
-                "last_seq": self.last_seq,
-                "last_heartbeat": self.last_heartbeat
+                "hp": self.hp
             })
 
             asyncio.create_task(try_enqueue_redis(snapshot))
@@ -332,8 +353,14 @@ class GameServerProtocol(QuicConnectionProtocol):
             self.y += dy
 
         # --- Clamp to map ---
-        self.x = max(0, min(self.x, MAP_WIDTH - PLAYER_WIDTH))
-        self.y = max(0, min(self.y, MAP_HEIGHT - PLAYER_HEIGHT))
+        self.x = max(
+            -MAP_HALF_WIDTH,
+            min(self.x, MAP_HALF_WIDTH - PLAYER_WIDTH)
+        )
+        self.y = max(
+            -MAP_HALF_HEIGHT,
+            min(self.y, MAP_HALF_HEIGHT - PLAYER_HEIGHT)
+        )
 
     # ===========================
     # CONNECTION LOSS
@@ -367,11 +394,12 @@ class GameServerProtocol(QuicConnectionProtocol):
         for client in list(CONNECTED_CLIENTS):
             if client is not self:
                 payload = struct.pack(
-                    "!B16sff",           # means transfer one byte 16 bytes and two floats
+                    "!B16sfff",           # means transfer one byte 16 bytes and two floats
                     1,                    # msg_type = world update
                     self.client_id.bytes,     # who moved in bytes format
                     self.x,
-                    self.y
+                    self.y,
+                    self.hp
                 )
 
                 packet = struct.pack("!H", len(payload)) + payload
@@ -381,11 +409,12 @@ class GameServerProtocol(QuicConnectionProtocol):
     def broadcast_online_clients(self):
         for client in list(CONNECTED_CLIENTS):
             payload = struct.pack(
-                "!B16sff",
+                "!B16sfff",
                 2,                    # msg_type = online members
                 client.client_id.bytes,
                 client.x,
-                client.y
+                client.y,
+                client.hp
             )
 
             packet = struct.pack("!H", len(payload)) + payload
@@ -395,11 +424,12 @@ class GameServerProtocol(QuicConnectionProtocol):
     def broadcast_new_connection(self):
         for client in list(CONNECTED_CLIENTS):
             payload = struct.pack(
-                "!B16sff",
+                "!B16sfff",
                 2,
                 self.client_id.bytes,
                 self.x,
-                self.y
+                self.y,
+                self.hp
             )
 
             packet = struct.pack("!H", len(payload)) + payload
@@ -420,10 +450,132 @@ class GameServerProtocol(QuicConnectionProtocol):
         self._quic.send_stream_data(self.control_stream_id, packet, end_stream=False)
         self.transmit()
 
+    def send_hp_update(self):
+        payload = struct.pack(
+            "!B16sfH",
+            7,
+            self.client_id.bytes,
+            self.hp,
+            self.damage_seq
+        )
+
+        packet = struct.pack("!H", len(payload)) + payload
+        self._quic.send_stream_data(self.control_stream_id, packet, end_stream=False)
+        self.transmit()
+
+    def broadcast_hp_update(self):
+        payload = struct.pack(
+            "!B16sfH",
+            8,
+            self.client_id.bytes,
+            self.hp,
+            self.damage_seq
+        )
+        packet = struct.pack("!H", len(payload)) + payload
+
+        for client in list(CONNECTED_CLIENTS):
+            if client is self:
+                continue
+
+            client._quic.send_stream_data(client.control_stream_id, packet, end_stream=False)
+            client.transmit()
+
+    def respawn(self):
+        self.x = -PLAYER_WIDTH // 2
+        self.y = -PLAYER_HEIGHT // 2
+        self.hp = 100
+
+        # important: new authoritative event
+        self.damage_seq = (self.damage_seq + 1) & 0xFFFF
+
+        snapshot = {
+            "client_id": self.client_id,
+            "x": self.x,
+            "y": self.y,
+            "hp": self.hp,
+        }
+
+        asyncio.create_task(try_enqueue_redis(snapshot))
+
+        # send BOTH hp + position
+        self.send_hp_update()
+        self.send_self_movement()
+        self.broadcast_world_state()
+
+
+# ===========================
+# ONE TIME FUNCTION
+# ===========================
+def seq_newer(a, b):
+    return ((a - b) & (SEQ_MAX - 1)) < SEQ_HALF
+
+async def load_tile_map(path: str):
+    tile_dict = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        for ty, line in enumerate(f):
+            for tx, ch in enumerate(line.strip("\n")):
+                if ch not in TILE_DEFS:
+                    continue
+
+                walkable = TILE_DEFS[ch]
+
+                tile_dict[(tx, ty)] = walkable
+
+    return tile_dict
 
 # ===========================
 # BACKGROUND TASKS
 # ===========================
+async def server_movement_tick():
+    while True:
+        await asyncio.sleep(SERVER_TICK)
+        for client in list(CONNECTED_CLIENTS):
+            if client.current_intent & DIR_MASK:
+                client.change_pos(client.current_intent)
+                client.send_self_movement()
+                client.broadcast_world_state()
+                client.current_intent = 0
+
+            snapshot = ({
+                "client_id": client.client_id,
+                "x": client.x,
+                "y": client.y,
+                "hp": client.hp
+            })
+
+            asyncio.create_task(try_enqueue_redis(snapshot))
+
+
+async def check_tile():
+    while True:
+        await asyncio.sleep(LAVA_INTERVAL)
+
+        for client in list(CONNECTED_CLIENTS):
+            tx = int((client.x + MAP_HALF_WIDTH) // TILE_SIZE)
+            ty = int((client.y + (PLAYER_HEIGHT - 15) + MAP_HALF_HEIGHT) // TILE_SIZE)
+
+            walkable = TILE_DICT.get((tx, ty), True)
+
+            if not walkable:
+                client.damage_seq = (client.damage_seq + 1) & 0xFFFF
+                client.hp -= LAVA_DAMAGE
+
+                if client.hp <= 0:
+                    client.respawn()
+                    continue
+
+                snapshot = {
+                    "client_id": client.client_id,
+                    "x": client.x,
+                    "y": client.y,
+                    "hp": client.hp,
+                }
+
+                asyncio.create_task(try_enqueue_redis(snapshot))
+
+                client.send_hp_update()
+                client.broadcast_hp_update()
 
 
 async def broadcast_server():
@@ -462,10 +614,6 @@ async def check_heartbeats():
 
 
 async def start_server():
-    global redis_client
-
-    redis_client = redis.Redis(host="localhost", port=6379, decode_responses=False)
-
     # Quic settings
     config = QuicConfiguration(
         is_client=False,  # This is not a client this is a server.
@@ -479,6 +627,8 @@ async def start_server():
 
     asyncio.create_task(redis_writer())
     asyncio.create_task(check_heartbeats())
+    asyncio.create_task(server_movement_tick())
+    asyncio.create_task(check_tile())
 
     await serve(  # Pause the whole function until this is done (until server is fully started)
         "0.0.0.0",  # Anyone wanting to connect can connect
@@ -494,6 +644,12 @@ async def start_server():
 
 
 async def main():
+    global redis_client
+    global TILE_DICT
+
+    TILE_DICT = await load_tile_map(MAP_PATH)
+    redis_client = redis.Redis(host="localhost", port=6379, decode_responses=False)
+
     server_task = asyncio.create_task(start_server())
     broadcast_task = asyncio.create_task(broadcast_server())
     try:
@@ -503,5 +659,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    print("server is running...")
     asyncio.run(main())

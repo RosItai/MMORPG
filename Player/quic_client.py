@@ -14,7 +14,7 @@ from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
 from collections import deque
 
 IMAGE = 'men-stands.png'
-IMAGE_BK = "Background.png"
+MAP_PATH = "new_map.txt"
 
 SPEED = 3
 SPRINT_SPEED = 6
@@ -35,41 +35,90 @@ CROUCH = 1 << 5
 
 DIR_MASK = UP | LEFT | DOWN | RIGHT
 
-MAP_WIDTH = 2500
-MAP_HEIGHT = 1500
+MAP_WIDTH = 1920 * 40 # 76800 pixels
+MAP_HEIGHT = 1080 * 40 # 43200 pixels
+MAP_HALF_WIDTH = MAP_WIDTH // 2
+MAP_HALF_HEIGHT = MAP_HEIGHT // 2
 
 PLAYER_WIDTH = 37
 PLAYER_HEIGHT = 56
+
+HP_BAR_WIDTH = 40
+HP_BAR_HEIGHT = 6
+HP_BAR_OFFSET_Y = 10
+
+TILE_SIZE =40
+TILE_DEFS = {
+    '.': ("ground.png", True),
+
+    '#': ("lava.png", False),
+
+    '←': ("grnd_lava_left.png", True),
+    '→': ("grnd_lava_right.png", True),
+    '↑': ("grnd_lava_up.png", True),
+    '↓': ("grnd_lava_down.png", True),
+
+    '↖': ("grnd_lava_up_left.png", True),
+    '↗': ("grnd_lava_up_right.png", True),
+    '↘': ("grnd_lava_down_right.png", True),
+    '↙': ("grnd_lava__left_down.png", True),
+
+    '⇦': ("grnd_lava_up_right_down.png", True),
+    '⇨': ("grnd_lava_up_left_down.png", True),
+    '⇧': ("grnd_lava_left_down_right.png", True),
+    '⇩': ("grnd_lava_left_up_right.png", True),
+}
+TILE_DICT = {}
+HALF_TILE = TILE_SIZE // 2
+
+LAVA_DAMAGE = 2.5
+LAVA_INTERVAL = 0.5
+
+SEQ_BITS = 16
+SEQ_MAX = 1 << SEQ_BITS
+SEQ_HALF = SEQ_MAX >> 1
 
 
 class Player:
     def __init__(self):
         super().__init__()
-        self.x = WIDTH//2 - 18
-        self.y = HEIGHT//2 - 28
-
+        self.x = -PLAYER_WIDTH // 2
+        self.y = -PLAYER_HEIGHT // 2
+        self.hp = 100
 
 class GameClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.client_id = None
-        self.player = Player()
         self.connected = False
+
+        self.player = Player()
         self.players = {}
-        self.image_bk = pygame.image.load(IMAGE_BK)
+
         self.image = pygame.image.load(IMAGE)
         self.rect = self.image.get_rect()
         self.rect.x = WIDTH//2 - 18
         self.rect.y = HEIGHT//2 - 28
+
         self.input_seq = 0
         self.pending_inputs = []
+
         self.control_stream_id = None
         self.input_stream_id = None
+
         self.recv_buffer = bytearray()
+
         self.last_server_activity = time.monotonic()
         self.last_ping_sent = 0.0
+
         self.message_queue = deque()
+
         self.initialized = False
+
+        self.last_lava_check = time.monotonic()
+        self.local_damage_seq = 0
+        self.last_server_damage_seq = 0
+        self.pending_damage = []
 
     def quic_event_received(self, event):
         if isinstance(event, HandshakeCompleted):
@@ -118,7 +167,7 @@ class GameClientProtocol(QuicConnectionProtocol):
         msg_type = data[0]
 
         if msg_type == 1:  # check if it's a world update (1 = world update from server)
-            raw_id, x, y = struct.unpack("!16sff", data[1:])
+            raw_id, x, y, hp = struct.unpack("!16sfff", data[1:])
             client_id = uuid.UUID(bytes=raw_id)
             if client_id != self.client_id:
                 if client_id not in self.players:
@@ -127,17 +176,19 @@ class GameClientProtocol(QuicConnectionProtocol):
                     self.players[client_id] = [player, rect]
 
                 if client_id in self.players:
-                    self.players[client_id][0].x = int(x)
-                    self.players[client_id][0].y = int(y)
+                    self.players[client_id][0].x = x
+                    self.players[client_id][0].y = y
+                    self.players[client_id][0].hp = hp
 
         elif msg_type == 0:  # message after handshake
-            raw_id, x, y = struct.unpack("!16sff", data[1:])
+            raw_id, x, y, hp = struct.unpack("!16sfff", data[1:])
             client_id = uuid.UUID(bytes=raw_id)
             self.control_stream_id = stream_id
             self.client_id = client_id
             self.players[client_id] = [self.player, self.rect]
-            self.players[client_id][0].x = int(x)
-            self.players[client_id][0].y = int(y)
+            self.players[client_id][0].x = x
+            self.players[client_id][0].y = y
+            self.players[client_id][0].hp = hp
             self.initialized = True
 
         elif msg_type == 3:  # a player disconnected
@@ -146,15 +197,16 @@ class GameClientProtocol(QuicConnectionProtocol):
             self.players.pop(client_id, None)
 
         elif msg_type == 2:  # players already online
-            raw_id, x, y = struct.unpack("!16sff", data[1:])
+            raw_id, x, y, hp = struct.unpack("!16sfff", data[1:])
             client_id = uuid.UUID(bytes=raw_id)
             if client_id != self.client_id:
                 if client_id not in self.players:
                     player = Player()
                     rect = self.image.get_rect()
                     self.players[client_id] = [player, rect]
-                    self.players[client_id][0].x = int(x)
-                    self.players[client_id][0].y = int(y)
+                    self.players[client_id][0].hp = hp
+                    self.players[client_id][0].x = x
+                    self.players[client_id][0].y = y
                     self.players[client_id][1].x = self.players[self.client_id][0].x - int(x)
                     self.players[client_id][1].y = self.players[self.client_id][0].y - int(y)
 
@@ -162,13 +214,13 @@ class GameClientProtocol(QuicConnectionProtocol):
             raw_id, x, y, last_seq = struct.unpack("!16sffH", data[1:])
             client_id = uuid.UUID(bytes=raw_id)
             if client_id == self.client_id:
-                self.players[self.client_id][0].x = int(x)
-                self.players[self.client_id][0].y = int(y)
+                self.players[self.client_id][0].x = x
+                self.players[self.client_id][0].y = y
 
                 self.pending_inputs = [
                     (seq, intent)
                     for (seq, intent) in self.pending_inputs
-                    if seq > last_seq
+                    if seq_newer(seq, last_seq)
                 ]
                 # these lines discard the old intents already confirmed by the server
                 # and keeps the ones that have not yet been confirmed by the server
@@ -179,6 +231,36 @@ class GameClientProtocol(QuicConnectionProtocol):
 
         elif msg_type == 6:
             pass
+
+        elif msg_type == 7: # local hp change
+            raw_id, hp, server_seq = struct.unpack("!16sfH", data[1:])
+            cid = uuid.UUID(bytes=raw_id)
+            if cid != self.client_id:
+                return
+
+            # authoritative snap
+            self.last_server_damage_seq = server_seq
+            self.player.hp = hp
+
+            # if server healed us (respawn), clear predictions
+            if hp == 100:
+                self.pending_damage.clear()
+                self.local_damage_seq = server_seq
+
+            # discard confirmed predictions
+            self.pending_damage = [
+                seq for seq in self.pending_damage if seq_newer(seq, server_seq)
+            ]
+
+            # reapply unconfirmed predicted damage
+            for _ in self.pending_damage:
+                self.player.hp -= LAVA_DAMAGE
+
+        elif msg_type == 8:
+            raw_id, hp, server_seq = struct.unpack("!16sfH", data[1:])
+            cid = uuid.UUID(bytes=raw_id)
+            if cid != self.client_id:
+                self.players[cid][0].hp = hp
 
     def send_intent(self, intent):
         if not self.initialized:
@@ -209,16 +291,42 @@ class GameClientProtocol(QuicConnectionProtocol):
         local_player = self.players[self.client_id][0]
 
         # draw background using camera offset
-        cam_x = local_player.x - WIDTH // 2
-        cam_y = local_player.y - HEIGHT // 2
+        cam_x = local_player.x - (WIDTH // 2)
+        cam_y = local_player.y - (HEIGHT // 2)
 
-        cam_x = max(0, min(cam_x, MAP_WIDTH - WIDTH))
-        cam_y = max(0, min(cam_y, MAP_HEIGHT - HEIGHT))
+        cam_x = max(-MAP_HALF_WIDTH, min(cam_x, MAP_HALF_WIDTH - WIDTH))
+        cam_y = max(-MAP_HALF_HEIGHT, min(cam_y, MAP_HALF_HEIGHT - HEIGHT))
 
-        camera_rect = pygame.Rect(cam_x, cam_y, WIDTH, HEIGHT)
+        world_left = cam_x
+        world_right = cam_x + WIDTH
+        world_top = cam_y
+        world_bottom = cam_y + HEIGHT
 
-        view = self.image_bk.subsurface(camera_rect)
-        screen.blit(view, (0,0))
+        left = int(((world_left + MAP_HALF_WIDTH) // TILE_SIZE)) - 1
+        right = int(((world_right + MAP_HALF_WIDTH) // TILE_SIZE)) + 1
+        top = int(((world_top + MAP_HALF_HEIGHT) // TILE_SIZE)) - 1
+        bottom = int(((world_bottom + MAP_HALF_HEIGHT) // TILE_SIZE)) + 1
+
+        left = max(left, 0)
+        right = min(right, 1919)
+        top = max(top, 0)
+        bottom = min(bottom, 1079)
+
+        for ty in range(top, bottom + 1):
+            for tx in range(left, right + 1):
+
+                tile = TILE_DICT.get((tx, ty))
+                if tile is None:
+                    continue
+
+                image, world_x, world_y, _ = tile
+
+                screen_x = world_x - cam_x
+                screen_y = world_y - cam_y
+
+                screen.blit(image,(screen_x, screen_y))
+
+        max_hp = 100
 
         for pid, (player, _) in self.players.items():
             if pid != self.client_id:
@@ -226,10 +334,38 @@ class GameClientProtocol(QuicConnectionProtocol):
                 screen_y = player.y - cam_y
                 screen.blit(self.image, (screen_x, screen_y))
 
+
+        for pid, (player, _) in self.players.items():
+            if pid == self.client_id:
+                continue
+
+            ratio = max(0, player.hp) / max_hp
+
+            screen_x = player.x - cam_x
+            screen_y = player.y - cam_y
+
+            bar_x = screen_x + PLAYER_WIDTH // 2 - HP_BAR_WIDTH // 2
+            bar_y = screen_y - HP_BAR_OFFSET_Y
+
+            pygame.draw.rect(
+                screen,
+                (255, 0, 0),
+                (bar_x, bar_y, HP_BAR_WIDTH, HP_BAR_HEIGHT)
+            )
+            pygame.draw.rect(
+                screen,
+                (0, 255, 0),
+                (bar_x, bar_y, HP_BAR_WIDTH * ratio, HP_BAR_HEIGHT)
+            )
+
         item = self.players[self.client_id]
         screen_x = item[0].x - cam_x
         screen_y = item[0].y - cam_y
         screen.blit(self.image, (screen_x, screen_y))
+
+        ratio = max(0, self.player.hp) / max_hp
+        pygame.draw.rect(screen, (255, 0, 0), (20, 40, 200, 10))
+        pygame.draw.rect(screen, (0, 255, 0), (20, 40, 200 * ratio, 10))
 
     def send_disconnect(self):
         if self.client_id not in self.players:
@@ -320,8 +456,14 @@ class GameClientProtocol(QuicConnectionProtocol):
         if allow_y:
             local_player.y += dy
 
-        new_x = max(0, min(local_player.x, MAP_WIDTH - PLAYER_WIDTH))
-        new_y = max(0, min(local_player.y, MAP_HEIGHT - PLAYER_HEIGHT))
+        new_x = max(
+            -MAP_HALF_WIDTH,
+            min(local_player.x, MAP_HALF_WIDTH - PLAYER_WIDTH)
+        )
+        new_y = max(
+            -MAP_HALF_HEIGHT,
+            min(local_player.y, MAP_HALF_HEIGHT - PLAYER_HEIGHT)
+        )
 
         # Apply movement
         self.players[self.client_id][0].x = new_x
@@ -329,7 +471,52 @@ class GameClientProtocol(QuicConnectionProtocol):
 
     def convert_images(self):
         self.image = self.image.convert_alpha()
-        self.image_bk = self.image_bk.convert()
+        for ch, (img, walkable) in TILE_DEFS.items():
+            img = pygame.image.load(img)
+            TILE_DEFS[ch] = (img.convert(), walkable)
+
+    def is_in_lava(self):
+        tx = int((self.player.x + MAP_HALF_WIDTH) // TILE_SIZE)
+        ty = int((self.player.y + (PLAYER_HEIGHT - 15) + MAP_HALF_HEIGHT) // TILE_SIZE)
+        return not TILE_DICT.get((tx, ty), True)
+
+    def predict_lava_if_needed(self):
+        # only predict if:
+        # 1. we are standing in lava
+        # 2. we have NO unconfirmed damage predicted
+        if not self.is_in_lava():
+            return
+
+        if self.pending_damage:
+            return  # already predicted one, wait for server
+
+        # predict exactly ONE future server damage
+        self.local_damage_seq = (self.local_damage_seq + 1) & 0xFFFF
+        self.pending_damage.append(self.local_damage_seq)
+        self.player.hp -= LAVA_DAMAGE
+
+
+def seq_newer(a, b):
+    return ((a - b) & (SEQ_MAX - 1)) < SEQ_HALF
+
+
+async def load_tile_map(path: str):
+    tile_dict = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        for ty, line in enumerate(f):
+            for tx, ch in enumerate(line.strip("\n")):
+                if ch not in TILE_DEFS:
+                    continue
+
+                image, walkable = TILE_DEFS[ch]
+
+                world_x = tx * TILE_SIZE - MAP_HALF_WIDTH
+                world_y = ty * TILE_SIZE - MAP_HALF_HEIGHT
+
+                tile_dict[(tx, ty)] = (image, world_x, world_y, walkable)
+
+    return tile_dict
 
 
 async def display_fps(screen, clock):
@@ -339,6 +526,7 @@ async def display_fps(screen, clock):
 
 
 async def game_loop(client: GameClientProtocol):
+    global TILE_DICT
     pygame.init()
 
     width, height = 1200, 700
@@ -347,6 +535,7 @@ async def game_loop(client: GameClientProtocol):
     pygame.display.set_caption("MMO Game")
 
     client.convert_images()
+    TILE_DICT = await load_tile_map(MAP_PATH)
 
     running = True
 
@@ -362,6 +551,7 @@ async def game_loop(client: GameClientProtocol):
                 running = False
 
         client.process_pending_messages()
+        client.predict_lava_if_needed()
 
         if current_time - last_input_time >= input_cooldown:
             keys = pygame.key.get_pressed()
@@ -468,7 +658,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        print("client is running...")
+        print("running")
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
