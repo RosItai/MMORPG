@@ -5,7 +5,6 @@ import time
 import uuid
 import asyncio
 import struct
-import redis.asyncio as redis
 from aioquic.asyncio import serve, QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
@@ -20,7 +19,7 @@ SERVER_TICK = 1/60
 CONNECTED_CLIENTS = set()
 
 SPEED = 3
-SPRINT_SPEED = 6
+SPRINT_SPEED = 60
 CROUCH_SPEED = 1
 
 UP = 1 << 0
@@ -68,57 +67,6 @@ LAVA_INTERVAL = 0.5
 SEQ_BITS = 16
 SEQ_MAX = 1 << SEQ_BITS
 SEQ_HALF = SEQ_MAX >> 1
-
-redis_client: redis.Redis | None = None
-redis_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
-
-# ===========================
-# REDIS HELPERS
-# ===========================
-
-async def try_enqueue_redis(snapshot):
-    try:
-        redis_queue.put_nowait(snapshot)
-    except asyncio.QueueFull:
-        # drop write
-        pass
-
-
-def redis_player_key(client_id: uuid.UUID) -> str:
-    return f"player:{client_id}"
-
-
-async def redis_load_player_state(client_id: uuid.UUID):
-    key = redis_player_key(client_id)
-    data = await redis_client.hgetall(key)
-
-    if not data:
-        return None
-
-    return {
-        "x": float(data[b"x"]),
-        "y": float(data[b"y"]),
-        "hp": int(data[b"hp"]),
-    }
-
-
-async def redis_writer():
-    while True:
-        snapshot = await redis_queue.get()
-
-        try:
-            key = redis_player_key(snapshot["client_id"])
-            await redis_client.hset(
-                key,
-                mapping={
-                    "x": snapshot["x"],
-                    "y": snapshot["y"],
-                    "hp": snapshot["hp"],
-                }
-            )
-        except Exception as e:
-            print("redis write failed:", e)
-
 
 # ===========================
 # QUIC GAME SERVER
@@ -174,27 +122,10 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.control_stream_id = self._quic.get_next_available_stream_id(False)
         self.state_stream_id = self._quic.get_next_available_stream_id(True)
 
-        # Authoritative load
-        state = await redis_load_player_state(self.client_id)
-
-        if state:
-            self.x = state["x"]
-            self.y = state["y"]
-            self.hp = state["hp"]
-        else:
-            # First time players
-            self.x = -PLAYER_WIDTH // 2
-            self.y = -PLAYER_HEIGHT // 2
-            self.hp = 100
-
-            snapshot = ({
-                "client_id": self.client_id,
-                "x": self.x,
-                "y": self.y,
-                "hp": self.hp
-            })
-
-            await try_enqueue_redis(snapshot)
+        # First time players
+        self.x = -PLAYER_WIDTH // 2
+        self.y = -PLAYER_HEIGHT // 2
+        self.hp = 100
 
         CONNECTED_CLIENTS.add(self)
 
@@ -258,14 +189,6 @@ class GameServerProtocol(QuicConnectionProtocol):
 
         elif msg_type == 5:
             self.last_heartbeat = time.time()
-            snapshot = ({
-                "client_id": self.client_id,
-                "x": self.x,
-                "y": self.y,
-                "hp": self.hp
-            })
-
-            asyncio.create_task(try_enqueue_redis(snapshot))
 
             payload = struct.pack("!B", 6) # msg type 6 = pong
             packet = struct.pack("!H", len(payload)) + payload
@@ -369,11 +292,6 @@ class GameServerProtocol(QuicConnectionProtocol):
     def connection_loss(self):
         if self in CONNECTED_CLIENTS:
             CONNECTED_CLIENTS.remove(self)
-
-        if self.client_id:
-            asyncio.create_task(
-                redis_client.expire(redis_player_key(self.client_id),30) # Expire after 30 seconds
-            )
 
         print(f"Client {self.client_id} disconnected")
 
@@ -488,15 +406,6 @@ class GameServerProtocol(QuicConnectionProtocol):
         # important: new authoritative event
         self.damage_seq = (self.damage_seq + 1) & 0xFFFF
 
-        snapshot = {
-            "client_id": self.client_id,
-            "x": self.x,
-            "y": self.y,
-            "hp": self.hp,
-        }
-
-        asyncio.create_task(try_enqueue_redis(snapshot))
-
         # send BOTH hp + position
         self.send_hp_update()
         self.send_self_movement()
@@ -537,15 +446,6 @@ async def server_movement_tick():
                 client.broadcast_world_state()
                 client.current_intent = 0
 
-            snapshot = ({
-                "client_id": client.client_id,
-                "x": client.x,
-                "y": client.y,
-                "hp": client.hp
-            })
-
-            asyncio.create_task(try_enqueue_redis(snapshot))
-
 
 async def check_tile():
     while True:
@@ -564,15 +464,6 @@ async def check_tile():
                 if client.hp <= 0:
                     client.respawn()
                     continue
-
-                snapshot = {
-                    "client_id": client.client_id,
-                    "x": client.x,
-                    "y": client.y,
-                    "hp": client.hp,
-                }
-
-                asyncio.create_task(try_enqueue_redis(snapshot))
 
                 client.send_hp_update()
                 client.broadcast_hp_update()
@@ -625,7 +516,6 @@ async def start_server():
     # The certificate contains my public key and the server identity info.
     # The certificate proves who you are and the private key proves you own it.
 
-    asyncio.create_task(redis_writer())
     asyncio.create_task(check_heartbeats())
     asyncio.create_task(server_movement_tick())
     asyncio.create_task(check_tile())
@@ -644,11 +534,9 @@ async def start_server():
 
 
 async def main():
-    global redis_client
     global TILE_DICT
 
     TILE_DICT = await load_tile_map(MAP_PATH)
-    redis_client = redis.Redis(host="localhost", port=6379, decode_responses=False)
 
     server_task = asyncio.create_task(start_server())
     broadcast_task = asyncio.create_task(broadcast_server())
